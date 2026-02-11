@@ -1,7 +1,7 @@
 use std::collections::{HashMap, BTreeMap};
 use std::fs;
-use std::io::{self, Write};
 use std::path::PathBuf;
+use console::Term;
 
 #[derive(Debug, Default)]
 struct AceScanStats {
@@ -16,8 +16,32 @@ struct AceScanStats {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 智能文件选择：优先 fk-df.txt，否则扫描当前目录所有txt
-    let log_path = select_log_file()?;
+    // 获取命令行参数
+    let args: Vec<String> = std::env::args().collect();
+    
+    // 确定日志文件路径：有参数用参数，否则用默认的 fk-df.txt
+    let log_path = if args.len() > 1 {
+        PathBuf::from(&args[1])
+    } else {
+        PathBuf::from("fk-df.txt")
+    };
+    
+    // 检查文件是否存在
+    if !log_path.exists() {
+        return Err(format!(
+            "❌ 文件不存在: {}\n   使用方法: {} <文件路径> 或直接拖放文件到程序上",
+            log_path.display(),
+            args.get(0).map(|s| s.as_str()).unwrap_or("程序名")
+        ).into());
+    }
+    
+    // 验证是否为有效的火绒日志文件
+    if !is_huorong_log(&log_path)? {
+        return Err(format!(
+            "❌ 不是有效的火绒安全日志文件（需包含 'SGuard' 和 '操作文件：' 特征）: {}",
+            log_path.display()
+        ).into());
+    }
     
     println!("🔍 正在分析日志文件: {}", log_path.display());
     let contents = fs::read_to_string(&log_path)?;
@@ -30,67 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     generate_detailed_report(&stats);
     export_high_risk_targets(&stats)?;
     
+    println!("\n>>> 按任意键退出程序 <<<");
+    Term::stdout().read_char().unwrap();
     Ok(())
-}
-
-/// 智能选择日志文件：优先 fk-df.txt，否则扫描当前目录
-fn select_log_file() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let default_path = PathBuf::from("fk-df.txt");
-    
-    // 优先尝试默认文件
-    if default_path.exists() && is_huorong_log(&default_path)? {
-        return Ok(default_path);
-    }
-    
-    // 扫描当前目录所有 .txt 文件
-    let mut candidate_files = Vec::new();
-    for entry in fs::read_dir(".")? {
-        let entry = entry?;
-        let path = entry.path();
-        
-        if path.extension() == Some(std::ffi::OsStr::new("txt")) 
-            && path.is_file() 
-            && is_huorong_log(&path)? 
-        {
-            candidate_files.push(path);
-        }
-    }
-    
-    // 无候选文件
-    if candidate_files.is_empty() {
-        return Err("❌ 未找到有效的火绒安全日志文件（需包含 'SGuard' 和 '操作文件：' 特征）".into());
-    }
-    
-    // 单文件直接使用
-    if candidate_files.len() == 1 {
-        return Ok(candidate_files.remove(0));
-    }
-    
-    // 多文件让用户选择
-    println!("\n📋 检测到多个火绒日志文件，请选择要分析的文件：");
-    for (i, path) in candidate_files.iter().enumerate() {
-        let metadata = fs::metadata(path)?;
-        let size_kb = metadata.len() as f64 / 1024.0;
-        println!("  {}. {} ({:.1} KB)", i + 1, path.display(), size_kb);
-    }
-    
-    // 获取用户输入
-    let mut input = String::new();
-    loop {
-        print!("\n请输入文件编号 (1-{}): ", candidate_files.len());
-        io::stdout().flush()?;
-        io::stdin().read_line(&mut input)?;
-        
-        match input.trim().parse::<usize>() {
-            Ok(idx) if idx > 0 && idx <= candidate_files.len() => {
-                return Ok(candidate_files.remove(idx - 1));
-            }
-            _ => {
-                println!("❌ 无效输入，请输入 1 到 {} 之间的数字", candidate_files.len());
-                input.clear();
-            }
-        }
-    }
 }
 
 /// 检测是否为火绒安全日志（快速特征检测）
@@ -221,6 +187,40 @@ fn categorize_target(file_path: &str, categories: &mut HashMap<String, usize>) {
     *categories.entry(category.to_string()).or_insert(0) += 1;
 }
 
+/// 计算字符串在等宽终端中的显示宽度（中文字符占2，英文占1）
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| {
+        if c.len_utf8() > 1 {
+            2 // 中文、emoji等宽字符
+        } else {
+            1 // ASCII字符
+        }
+    }).sum()
+}
+
+/// 截断或填充字符串到指定显示宽度
+fn pad_to_width(s: &str, width: usize) -> String {
+    let current_width = display_width(s);
+    if current_width >= width {
+        // 需要截断
+        let mut result = String::new();
+        let mut current = 0;
+        for c in s.chars() {
+            let w = if c.len_utf8() > 1 { 2 } else { 1 };
+            if current + w > width - 1 {
+                result.push('…');
+                break;
+            }
+            result.push(c);
+            current += w;
+        }
+        result
+    } else {
+        // 填充空格
+        format!("{}{}", s, " ".repeat(width - current_width))
+    }
+}
+
 fn generate_detailed_report(stats: &AceScanStats) {
     const WIDTH: usize = 76;
     println!("\n{}", "=".repeat(WIDTH));
@@ -228,7 +228,7 @@ fn generate_detailed_report(stats: &AceScanStats) {
     println!("{:^WIDTH$}", format!("(基于 {} 条有效日志条目)", stats.total_attempts));
     println!("{}", "=".repeat(WIDTH));
 
-    println!("\n【📊 核心指标】");
+    println!("\n「📊 核心指标」");
     println!("  • 总扫盘尝试次数: {:>10}", stats.total_attempts);
     let block_rate = if stats.total_attempts > 0 {
         stats.blocked_attempts as f64 / stats.total_attempts as f64 * 100.0
@@ -239,7 +239,7 @@ fn generate_detailed_report(stats: &AceScanStats) {
     println!("  • 唯一目标文件数: {:>10}", stats.unique_files.len());
     println!("  • 活跃进程数:     {:>10}", stats.processes.len());
 
-    println!("\n【🔍 进程行为分析】");
+    println!("\n「🔍 进程行为分析」");
     let mut procs: Vec<_> = stats.processes.iter().collect();
     procs.sort_by(|a, b| b.1.cmp(a.1));
     for (i, (proc, count)) in procs.iter().take(5).enumerate() {
@@ -253,8 +253,9 @@ fn generate_detailed_report(stats: &AceScanStats) {
         println!("  {:2}. {:28} {:>8} 次  {}", i + 1, proc, count, risk_level);
     }
 
-    println!("\n【⚠️ 高频扫描目标 (Top 15)】");
-    println!("  {:>4} {:<50} {:>8} {}", "排名", "文件路径", "频次", "风险");
+    // 修复对齐：统一使用固定宽度
+    println!("\n「⚠️ 高频扫描目标 (Top 15)」");
+    println!("  {:>4}  {:<50} {:>8}  {}", "排名", "文件路径", "频次", "风险");
     println!("  {}", "-".repeat(74));
 
     let mut files: Vec<_> = stats.unique_files.iter().collect();
@@ -268,19 +269,27 @@ fn generate_detailed_report(stats: &AceScanStats) {
         } else {
             "🟢"
         };
-        let display_path = if file.chars().count() > 50 {
-            let prefix: String = file.chars().take(4).collect();
-            let suffix: String = file.chars().skip(file.chars().count().saturating_sub(46)).collect();
+        
+        // 处理文件路径显示：截断中间部分
+        let display_path = if display_width(file) > 50 {
+            let total_chars = file.chars().count();
+            let prefix_len = 20;
+            let suffix_len = 26;
+            let prefix: String = file.chars().take(prefix_len).collect();
+            let suffix: String = file.chars().skip(total_chars.saturating_sub(suffix_len)).collect();
             format!("{}...{}", prefix, suffix)
         } else {
             file.to_string()
         };
-        println!("  {:>3}. {:<50} {:>8} {}", i + 1, display_path, count, risk);
+        
+        // 使用 pad_to_width 确保严格对齐
+        let padded_path = pad_to_width(&display_path, 50);
+        println!("  {:>3}. {} {:>8}  {}", i + 1, padded_path, count, risk);
     }
 
-    // 修复格式对齐问题：统一使用固定宽度 + 中文字符补偿
-    println!("\n【📁 扫描目标分类统计】");
-    println!("  {:<22} {:>10} {:>12}  {}", "分类", "扫描次数", "占比", "风险");
+    // 修复格式对齐：使用 display_width 计算中文字符宽度进行补偿
+    println!("\n「📁 扫描目标分类统计」");
+    println!("  {:<20} {:>12} {:>12}  {}", "分类", "扫描次数", "占比", "风险");
     println!("  {}", "-".repeat(74));
     
     let mut cats: Vec<_> = stats.target_categories.iter().collect();
@@ -297,15 +306,22 @@ fn generate_detailed_report(stats: &AceScanStats) {
             "🟢"
         };
         
-        // 智能宽度补偿：中文字符占2英文宽度，英文占1
-        // 简单方案：固定分类名称宽度22字符（终端中约44英文字符宽度）
+        // 计算需要填充的空格数，确保对齐
+        let cat_width = display_width(cat);
+        let target_width = 20usize;
+        let padding = if cat_width < target_width {
+            target_width - cat_width
+        } else {
+            0
+        };
+        
         println!(
-            "  {:<22} {:>10} 次 ({:>6.1}%)  {}",
-            cat, count_val, percent, risk_icon
+            "  {}{:padding$} {:>10} 次 ({:>6.1}%)  {}",
+            cat, "", count_val, percent, risk_icon
         );
     }
 
-    println!("\n【🧩 文件类型分布】");
+    println!("\n「🧩 文件类型分布」");
     let mut exts: Vec<_> = stats.file_extensions.iter().collect();
     exts.sort_by(|a, b| b.1.cmp(a.1));
     for (ext, count) in exts.iter().take(8) {
@@ -315,7 +331,7 @@ fn generate_detailed_report(stats: &AceScanStats) {
     }
 
     if !stats.time_distribution.is_empty() {
-        println!("\n【⏰ 扫描行为时间分布】");
+        println!("\n「⏰ 扫描行为时间分布」");
         let mut times: Vec<_> = stats.time_distribution.iter().collect();
         times.sort_by_key(|(k, _)| *k);
 
@@ -331,14 +347,14 @@ fn generate_detailed_report(stats: &AceScanStats) {
         }
     }
 
-    println!("\n【🛡️ 安全加固建议】");
+    println!("\n「🛡️ 安全加固建议」");
     println!("  1️⃣  驱动层防护：存储驱动(storqosflt.sys/storvsp.sys)被高频扫描，");
-    println!("      建议对 System32\\drivers 目录设置【仅监控】而非【阻止】");
+    println!("      建议对 System32\\drivers 目录设置「仅监控」而非「阻止」");
     println!("  2️⃣  虚拟化检测：hvhostsvc.dll/vmms.exe 等组件被扫描，");
     println!("      可能用于检测虚拟机环境，评估是否需放行相关路径");
     println!("  3️⃣  规则优化：100%拦截率可能导致游戏启动异常，");
-    println!("      建议对反作弊组件自身目录设置【放行】，对驱动目录设置【询问】");
-    println!("\n  💡 提示：已生成 high_risk_targets.csv（UTF-8 BOM 格式），Excel/WPS 可直接正常打开");
+    println!("      建议对反作弊组件自身目录设置「放行」，对驱动目录设置「询问」");
+
     println!("\n{}", "=".repeat(WIDTH));
 }
 
@@ -378,6 +394,7 @@ fn export_high_risk_targets(stats: &AceScanStats) -> Result<(), Box<dyn std::err
     bom_csv.extend_from_slice(csv.as_bytes());
     
     fs::write("high_risk_targets.csv", bom_csv)?;
+    
     println!("\n✅ 已导出高频扫描目标清单: high_risk_targets.csv");
     println!("   (UTF-8 BOM 格式，Excel/WPS 可直接正常打开中文)");
 
